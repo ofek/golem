@@ -103,9 +103,6 @@ class TaskManager(TaskEventListener):
             persist=self.task_persistence,
         )
 
-        if self.task_persistence:
-            self.restore_tasks()
-
     def get_task_manager_root(self):
         return self.root_path
 

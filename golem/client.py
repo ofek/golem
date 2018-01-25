@@ -81,7 +81,6 @@ class ClientTaskComputerEventListener(object):
 
 
 class Client(HardwarePresetsMixin):
-    _services = []  # type: List[IService]
 
     def __init__(
             self,
@@ -156,7 +155,8 @@ class Client(HardwarePresetsMixin):
         self._services = [
             NetworkConnectionPublisherService(
                 self,
-                int(self.config_desc.network_check_interval)),
+                max(1, int(self.config_desc.network_check_interval))
+            ),
             TaskArchiverService(self.task_archiver),
             MessageHistoryService(),
             DoWorkService(self),
@@ -164,12 +164,28 @@ class Client(HardwarePresetsMixin):
 
         clean_resources_older_than = \
             self.config_desc.clean_resources_older_than_seconds
+        clean_tasks_older_than = self.config_desc.clean_tasks_older_than_seconds
+
+        clean_resources_interval = max(30, int(clean_resources_older_than / 10))
+        clean_tasks_interval = max(30, int(clean_tasks_older_than / 10))
+
         if clean_resources_older_than > 0:
             self._services.append(
                 ResourceCleanerService(
                     self,
-                    interval_seconds=max(1, int(clean_resources_older_than/10)),
-                    older_than_seconds=clean_resources_older_than))
+                    interval_seconds=clean_resources_interval,
+                    older_than_seconds=clean_resources_older_than
+                )
+            )
+
+        if clean_tasks_older_than > 0:
+            self._services.append(
+                TaskCleanerService(
+                    self,
+                    interval_seconds=clean_tasks_interval,
+                    older_than_seconds=clean_tasks_older_than
+                )
+            )
 
         self.cfg = config
 
@@ -193,7 +209,7 @@ class Client(HardwarePresetsMixin):
         self.use_docker_machine_manager = use_docker_machine_manager
         self.connect_to_known_hosts = connect_to_known_hosts
         self.environments_manager = EnvironmentsManager()
-        self.daemon_manager = None
+        self.hyperdrive_manager = None
 
         self.rpc_publisher = None
 
@@ -219,9 +235,12 @@ class Client(HardwarePresetsMixin):
         StatusPublisher.set_publisher(self.rpc_publisher)
 
         if self.transaction_system:
-            self._services.append(BalancePublisherService(
-                self.rpc_publisher,
-                self.transaction_system))
+            self._services.append(
+                BalancePublisherService(
+                    self.rpc_publisher,
+                    self.transaction_system
+                )
+            )
 
     def p2p_listener(self, sender, signal, event='default', **kwargs):
         if event == 'unreachable':
@@ -246,107 +265,147 @@ class Client(HardwarePresetsMixin):
 
     @report_calls(Component.client, 'start', stage=Stage.pre)
     def start(self):
-        self.environments_manager.load_config(self.datadir)
-        self.concent_service.start()
 
-        if self.use_monitor and not self.monitor:
-            self.init_monitor()
-        try:
-            self.start_network()
-        except Exception:
-            log.critical('Can\'t start network. Giving up.', exc_info=True)
+        def terminate(exception):
+            log.error("Can't start network: %s. Giving up.", exception)
+            log.error(exception.__traceback__)
+
+            StatusPublisher.publish(Component.client, 'start',
+                                    stage=Stage.exception,
+                                    data=to_unicode(exception))
             sys.exit(1)
 
-        for service in self._services:
-            if not service.running:
-                service.start()
+        def start_network(*_):
+            self.start_network().addCallbacks(self.start_services, terminate)
+
+        self.environments_manager.load_config(self.datadir)
+        self.concent_service.start()
+        if self.use_monitor:
+            self.init_monitor()
+
+        try:
+            self.start_docker().addCallbacks(start_network, terminate)
+        except Exception as exc:
+            terminate(exc)
 
     @report_calls(Component.client, 'stop', stage=Stage.post)
     def stop(self):
+        self.stop_services()
         self.stop_network()
-
-        for service in self._services:
-            if service.running:
-                service.stop()
         self.concent_service.stop()
+
         if self.task_server:
             self.task_server.task_computer.quit()
         if self.use_monitor and self.monitor:
             self.stop_monitor()
             self.monitor = None
 
+    def start_services(self, *_):
+        for service in self._services:
+            if not service.running:
+                service.start()
+
+    def stop_services(self, *_):
+        for service in self._services:
+            if service.running:
+                service.stop()
+
+    def start_docker(self):
+        result = Deferred()
+
+        if self.use_docker_machine_manager:
+            log.info("Starting docker ...")
+
+            from golem.docker.manager import DockerManager
+            docker_manager = DockerManager.install()
+
+            request = AsyncRequest(docker_manager.check_environment)
+            async_run(request).chainDeferred(result)
+        else:
+            result.callback(True)
+
+        return result
+
     def start_network(self):
         log.info("Starting network ...")
+
         self.node.collect_network_info(self.config_desc.seed_host,
                                        use_ipv6=self.config_desc.use_ipv6)
-
         log.debug("Is super node? %s", self.node.is_super_node())
 
-        if not self.p2pservice:
-            self.p2pservice = P2PService(
-                self.node,
-                self.config_desc,
-                self.keys_auth,
-                connect_to_known_hosts=self.connect_to_known_hosts
+        self.p2pservice = P2PService(
+            self.node,
+            self.config_desc,
+            self.keys_auth,
+            connect_to_known_hosts=self.connect_to_known_hosts
+        )
+
+        self.task_server = TaskServer(
+            self.node,
+            self.config_desc,
+            self.keys_auth, self,
+            use_ipv6=self.config_desc.use_ipv6,
+            use_docker_machine_manager=self.use_docker_machine_manager,
+            task_archiver=self.task_archiver
+        )
+
+        self.hyperdrive_manager = HyperdriveDaemonManager(self.datadir)
+
+        self._services += [
+            MonitoringPublisherService(
+                self.task_server,
+                interval_seconds=max(
+                    1, int(self.config_desc.node_snapshot_interval)
+                )
+            ),
+            TasksPublisherService(
+                self.rpc_publisher,
+                self.task_server.task_manager
+            )
+        ]
+
+        def start_hyperdrive():
+            log.info("Starting hyperdrive ...")
+            self.hyperdrive_manager.start()
+
+            hyperdrive_addresses = self.hyperdrive_manager.public_addresses(
+                self.node.pub_addr)
+
+            dir_manager = self.task_server.task_computer.dir_manager
+
+            log.info("Starting resource server ...")
+            self.resource_server = BaseResourceServer(
+                HyperdriveResourceManager(dir_manager, hyperdrive_addresses),
+                dir_manager,
+                self.keys_auth, self
             )
 
-        if not self.task_server:
-            self.task_server = TaskServer(
-                self.node,
-                self.config_desc,
-                self.keys_auth, self,
-                use_ipv6=self.config_desc.use_ipv6,
-                use_docker_machine_manager=self.use_docker_machine_manager,
-                task_archiver=self.task_archiver)
+        def restore_tasks():
+            if not self.task_server.task_manager.task_persistence:
+                return
 
-            monitoring_publisher_service = MonitoringPublisherService(
-                    self.task_server,
-                    interval_seconds=max(
-                        int(self.config_desc.node_snapshot_interval),
-                        1))
-            monitoring_publisher_service.start()
-            self._services.append(monitoring_publisher_service)
-
-            if self.rpc_publisher:
-                tasks_publisher_service = TasksPublisherService(
-                    self.rpc_publisher,
-                    self.task_server.task_manager)
-                tasks_publisher_service.start()
-                self._services.append(tasks_publisher_service)
-
-            clean_tasks_older_than = \
-                self.config_desc.clean_tasks_older_than_seconds
-            if clean_tasks_older_than > 0:
-                task_cleaner_service = TaskCleanerService(
-                    self,
-                    interval_seconds=max(1, int(clean_tasks_older_than/10)),
-                    older_than_seconds=clean_tasks_older_than)
-                task_cleaner_service.start()
-                self._services.append(task_cleaner_service)
-
-        dir_manager = self.task_server.task_computer.dir_manager
-
-        log.info("Starting resource server ...")
-
-        if not self.daemon_manager:
-            self.daemon_manager = HyperdriveDaemonManager(self.datadir)
-            self.daemon_manager.start()
-
-        hyperdrive_addrs = self.daemon_manager.public_addresses(
-            self.node.pub_addr)
-        hyperdrive_ports = self.daemon_manager.ports()
-
-        if not self.resource_server:
-            resource_manager = HyperdriveResourceManager(dir_manager,
-                                                         hyperdrive_addrs)
-            self.resource_server = BaseResourceServer(resource_manager,
-                                                      dir_manager,
-                                                      self.keys_auth, self)
+            log.info("Restoring tasks ...")
+            self.task_server.task_manager.restore_tasks()
             self.task_server.restore_resources()
 
-        def connect(ports):
+        def start_accepting():
+            peer_manager = self.resource_server.resource_manager.peer_manager
+
+            log.info("Starting p2p server ...")
+            self.p2pservice.task_server = self.task_server
+            self.p2pservice.set_resource_server(self.resource_server)
+            self.p2pservice.set_metadata_manager(peer_manager)
+            self.p2pservice.start_accepting(listening_established=p2p.callback,
+                                            listening_failure=p2p.errback)
+
+            log.info("Starting task server ...")
+            self.task_server.start_accepting(
+                listening_established=task.callback,
+                listening_failure=task.errback)
+
+        def connect_to_network(ports):
             p2p_port, task_port = ports
-            all_ports = ports + list(hyperdrive_ports)
+            all_ports = ports + list(self.hyperdrive_manager.ports())
 
             log.info('P2P server is listening on port %s', p2p_port)
             log.info('Task server is listening on port %s', task_port)
@@ -368,30 +427,30 @@ class Client(HardwarePresetsMixin):
 
             StatusPublisher.publish(Component.client, 'start',
                                     stage=Stage.post)
+            ready.callback(True)
 
-        def terminate(*exceptions):
-            log.error("Golem cannot listen on ports: %s", exceptions)
-            StatusPublisher.publish(Component.client, 'start',
-                                    stage=Stage.exception,
-                                    data=[to_unicode(e) for e in exceptions])
-            sys.exit(1)
+        def _async(fn, *args, **kwargs):
+            request = AsyncRequest(fn, *args, **kwargs)
+            return async_run(request)
 
         task = Deferred()
         p2p = Deferred()
+        ready = Deferred()
 
-        gatherResults([p2p, task], consumeErrors=True).addCallbacks(connect,
-                                                                    terminate)
-        log.info("Starting p2p server ...")
-        resource_manager = self.resource_server.resource_manager
-        self.p2pservice.task_server = self.task_server
-        self.p2pservice.set_resource_server(self.resource_server)
-        self.p2pservice.set_metadata_manager(resource_manager.peer_manager)
-        self.p2pservice.start_accepting(listening_established=p2p.callback,
-                                        listening_failure=p2p.errback)
+        _async(start_hyperdrive).addCallbacks(
+            lambda *_: _async(restore_tasks).addCallbacks(
+                lambda *_: _async(start_accepting),
+                ready.errback
+            ),
+            ready.errback
+        )
 
-        log.info("Starting task server ...")
-        self.task_server.start_accepting(listening_established=task.callback,
-                                         listening_failure=task.errback)
+        gatherResults([p2p, task], consumeErrors=True).addCallbacks(
+            connect_to_network,
+            ready.errback
+        )
+
+        return ready
 
     def start_upnp(self, ports):
         self.port_mapper = PortMapperManager()
@@ -473,8 +532,8 @@ class Client(HardwarePresetsMixin):
             self.transaction_system.stop()
         if self.diag_service:
             self.diag_service.unregister_all()
-        if self.daemon_manager:
-            self.daemon_manager.stop()
+        if self.hyperdrive_manager:
+            self.hyperdrive_manager.stop()
 
         dispatcher.send(signal='golem.monitor', event='shutdown')
 

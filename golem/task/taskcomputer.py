@@ -65,8 +65,6 @@ class TaskComputer(object):
         self.waiting_for_task_session_timeout = None
 
         self.docker_manager = DockerManager.install()
-        if use_docker_machine_manager:
-            self.docker_manager.check_environment()
 
         self.use_docker_machine_manager = use_docker_machine_manager
         run_benchmarks = self.task_server.benchmark_manager.benchmarks_needed()
