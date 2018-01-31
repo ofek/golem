@@ -2,6 +2,7 @@ from datetime import datetime
 
 from peewee import IntegrityError
 
+import golem
 import golem.model as m
 
 from golem.network.p2p.node import Node
@@ -12,20 +13,20 @@ class TestDatabase(TempDirFixture, PEP8MixIn):
     PEP8_FILES = ["golem/model.py"]
 
     def test_init(self) -> None:
-        db = m.Database(self.path)
-        self.assertFalse(db.db.is_closed())
-        db.db.close()
+        database = golem.database.Database(m.db, self.path, m.DB_MODELS)
+        self.assertFalse(database.db.is_closed())
+        database.close()
 
     def test_schema_version(self):
-        db = m.Database(self.path)
-        self.assertEqual(db._get_user_version(), db.SCHEMA_VERSION)
-        self.assertNotEqual(db.SCHEMA_VERSION, 0)
+        database = golem.database.Database(m.db, self.path, m.DB_MODELS)
+        self.assertEqual(database._get_user_version(), database.SCHEMA_VERSION)
+        self.assertNotEqual(database.SCHEMA_VERSION, 0)
 
-        db._set_user_version(0)
-        self.assertEqual(db._get_user_version(), 0)
-        db = m.Database(self.path)
-        self.assertEqual(db._get_user_version(), db.SCHEMA_VERSION)
-        db.db.close()
+        database._set_user_version(0)
+        self.assertEqual(database._get_user_version(), 0)
+        database = golem.database.Database(m.db, self.path, m.DB_MODELS)
+        self.assertEqual(database._get_user_version(), database.SCHEMA_VERSION)
+        database.close()
 
 
 class TestPayment(DatabaseFixture):

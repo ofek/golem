@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch, ANY
 from golem_messages import message
 from twisted.internet.defer import Deferred
 
-from golem.model import Database
+from golem.database import Database
 from golem.network.hyperdrive.client import HyperdriveClientOptions, \
     HyperdriveClient
 from golem.resource.dirmanager import DirManager

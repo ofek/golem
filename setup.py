@@ -93,4 +93,18 @@ if building_wheel:
     move_wheel()
 
 
+try:
+    from golem.database.migration.creator import create_migration
+    migration_script_path = create_migration()
+except Exception:  # pylint: disable=broad-except
+    print("FATAL: cannot create a database migration script")
+    import traceback
+    traceback.print_exc()
+else:
+    if migration_script_path:
+        print("Database migration script has been created at {}.\n"
+              "Please check and edit the file before committing."
+              .format(migration_script_path))
+
+
 print_errors(task_collector_err)
