@@ -19,7 +19,7 @@ class Database:
 
         version = self._get_user_version()
 
-        if version is None:
+        if not version:
             self._create_database()
         elif migrate:
             self._migrate_database(version, to_version=self.SCHEMA_VERSION)
